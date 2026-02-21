@@ -1,13 +1,10 @@
 import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
+import { WebSocketServer } from "ws";
 import admin from "firebase-admin";
 
 // 1️⃣ 從 Render Secret 讀取 Firebase Admin Key
-const serviceAccountJSON = process.env.FIREBASE_ADMIN_KEY;
-if (!serviceAccountJSON) {
-  throw new Error("FIREBASE_ADMIN_KEY 未設定！");
-}
-const serviceAccount = JSON.parse(serviceAccountJSON);
+if (!process.env.FIREBASE_ADMIN_KEY) throw new Error("FIREBASE_ADMIN_KEY 未設定");
+const serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_KEY);
 
 // 2️⃣ 初始化 Firebase Admin SDK
 admin.initializeApp({
@@ -17,7 +14,7 @@ admin.initializeApp({
 // 3️⃣ Render 提供的 PORT
 const PORT = process.env.PORT || 8080;
 
-// 4️⃣ 建立 HTTP Server（WebSocket 必須附在 HTTP Server 上）
+// 4️⃣ 建 HTTP Server
 const server = http.createServer((req, res) => {
   res.writeHead(200);
   res.end("WebSocket Server running");
@@ -28,14 +25,14 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", async (ws, req) => {
   try {
-    // 從 URL 拿 Firebase ID Token
+    // 從 URL 讀取 Firebase ID Token
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const idToken = url.searchParams.get("token");
     if (!idToken) throw new Error("缺少 Firebase ID Token");
 
-    // 6️⃣ 用 Admin SDK 驗證 Token
+    // 6️⃣ 驗證 ID Token
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-    ws.userId = decodedToken.uid; // 綁定使用者 UID
+    ws.userId = decodedToken.uid; // 綁定 UID
     console.log(`使用者 ${ws.userId} 已連線`);
 
     ws.send(JSON.stringify({ success: true, message: "登入成功", uid: ws.userId }));
@@ -45,11 +42,10 @@ wss.on("connection", async (ws, req) => {
       try {
         const data = JSON.parse(msg);
 
-        // 只允許修改自己的資料
         if (data.action === "updateProfile" && data.uid === ws.userId) {
           console.log(`使用者 ${ws.userId} 更新資料:`, data.payload);
 
-          // TODO: 改成你資料庫更新邏輯
+          // TODO: 連接你的資料庫，更新使用者資料
           // updateDatabase(ws.userId, data.payload);
 
           ws.send(JSON.stringify({ success: true, message: "更新成功" }));
@@ -67,7 +63,5 @@ wss.on("connection", async (ws, req) => {
   }
 });
 
-// 8️⃣ HTTP Server 監聽 Render PORT
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// 8️⃣ 監聽 Render 提供的 PORT
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
