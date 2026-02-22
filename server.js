@@ -1,42 +1,38 @@
+// index.js
 import http from "http";
 import { WebSocketServer } from "ws";
 import admin from "firebase-admin";
+import { createClient } from "@supabase/supabase-js";
 
-/* =========================
-   1️⃣ Firebase 初始化
-========================= */
-
-if (!process.env.FIREBASE_ADMIN_KEY)
-  throw new Error("FIREBASE_ADMIN_KEY 未設定");
+// ======= 讀取 Render Secret =======
+if (!process.env.FIREBASE_ADMIN_KEY) throw new Error("FIREBASE_ADMIN_KEY 未設定");
+if (!process.env.SUPABASE_URL) throw new Error("SUPABASE_URL 未設定");
+if (!process.env.SUPABASE_SERVICE_KEY) throw new Error("SUPABASE_SERVICE_KEY 未設定");
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_KEY);
 
+// ======= 初始化 Firebase Admin =======
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
-const db = admin.firestore();
+// ======= 初始化 Supabase Client =======
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-/* =========================
-   2️⃣ Render PORT
-========================= */
-
+// ======= WebSocket 監聽 Port =======
 const PORT = process.env.PORT || 8080;
 
-/* =========================
-   3️⃣ HTTP Server
-========================= */
-
+// ======= HTTP Server (WebSocket 需要) =======
 const server = http.createServer((req, res) => {
   res.writeHead(200);
-  res.end("WebSocket Server running");
+  res.end("Master Server WebSocket running");
 });
 
-/* =========================
-   4️⃣ WebSocket Server
-========================= */
-
+// ======= 建立 WebSocket Server =======
 const wss = new WebSocketServer({ server });
+
+// ======= 可由前端修改的欄位（非付費） =======
+const ALLOWED_FIELDS = ["nickname", "avatar", "settings", "level", "score"];
 
 wss.on("connection", async (ws, req) => {
   try {
@@ -44,97 +40,96 @@ wss.on("connection", async (ws, req) => {
     const idToken = url.searchParams.get("token");
     if (!idToken) throw new Error("缺少 Firebase ID Token");
 
-    // 驗證 Token
+    // ======= 驗證 Firebase ID Token =======
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-    const uid = decodedToken.uid;
-    ws.userId = uid;
+    ws.userId = decodedToken.uid;
+    console.log(`使用者 ${ws.userId} 已連線`);
 
-    console.log(`使用者 ${uid} 已連線`);
+    ws.send(JSON.stringify({ success: true, message: "登入成功", uid: ws.userId }));
 
-    /* =========================
-       5️⃣ 建立初始資料（如果不存在）
-    ========================= */
-
-    const userRef = db.collection("users").doc(uid);
-    const doc = await userRef.get();
-
-    if (!doc.exists) {
-      await userRef.set({
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        nickname: "新玩家",
-        role: "player",
-        level: 1,
-        exp: 0,
-        money: 1000
-      });
-      console.log("已建立初始資料");
-    }
-
-    ws.send(JSON.stringify({
-      success: true,
-      message: "登入成功",
-      uid
-    }));
-
-    /* =========================
-       6️⃣ 處理前端訊息
-    ========================= */
-
+    // ======= 處理訊息 =======
     ws.on("message", async (msg) => {
       try {
         const data = JSON.parse(msg);
 
-        /* ===== 取得自己的資料 ===== */
-        if (data.action === "getProfile") {
-          const userDoc = await userRef.get();
-          ws.send(JSON.stringify({
-            success: true,
-            profile: userDoc.data()
-          }));
-        }
+        switch (data.action) {
 
-        /* ===== 更新自己的資料 ===== */
-        else if (data.action === "updateProfile") {
+          // -------- 更新遊戲資料 --------
+          case "updateProjectData":
+            if (!data.projectId || !data.payload) throw new Error("缺少 projectId 或 payload");
 
-          // 防止修改其他人資料
-          if (data.uid !== uid) {
-            ws.send(JSON.stringify({
-              success: false,
-              message: "非法操作"
-            }));
-            return;
-          }
-
-          // 可限制可修改欄位（避免亂改）
-          const allowedFields = ["nickname"];
-          const updateData = {};
-
-          for (const key of allowedFields) {
-            if (data.payload[key] !== undefined) {
-              updateData[key] = data.payload[key];
+            // 過濾欄位
+            const filteredPayload = {};
+            for (let key of ALLOWED_FIELDS) {
+              if (key in data.payload) filteredPayload[key] = data.payload[key];
             }
-          }
 
-          await userRef.update(updateData);
+            // 更新 Supabase
+            await supabase
+              .from("project_player_data")
+              .upsert({
+                uid: ws.userId,
+                project_id: data.projectId,
+                data: filteredPayload
+              }, { onConflict: ["uid", "project_id"] });
 
-          ws.send(JSON.stringify({
-            success: true,
-            message: "更新成功"
-          }));
-        }
+            ws.send(JSON.stringify({ success: true, message: "資料更新成功", payload: filteredPayload }));
+            break;
 
-        else {
-          ws.send(JSON.stringify({
-            success: false,
-            message: "未知指令"
-          }));
+          // -------- 兌換邀請碼 --------
+          case "redeemInvite":
+            if (!data.code) throw new Error("缺少邀請碼");
+
+            const { data: inviteData, error } = await supabase
+              .from("invite_codes")
+              .select("*")
+              .eq("code", data.code)
+              .single();
+
+            if (error || !inviteData) {
+              ws.send(JSON.stringify({ success: false, message: "無效邀請碼" }));
+              break;
+            }
+
+            if (inviteData.used_by) {
+              ws.send(JSON.stringify({ success: false, message: "邀請碼已使用" }));
+              break;
+            }
+
+            // 標記已使用
+            await supabase
+              .from("invite_codes")
+              .update({ used_by: ws.userId })
+              .eq("id", inviteData.id);
+
+            // TODO: 設定 Plan / Circuit 幣等
+            ws.send(JSON.stringify({ success: true, message: "邀請碼兌換成功", plan: inviteData.plan }));
+            break;
+
+          // -------- 發放 Circuit 幣 --------
+          case "earnCircuit":
+            if (!data.projectId || !data.amount || !data.source) throw new Error("缺少必要欄位");
+
+            await supabase
+              .from("circuit_ledger")
+              .insert({
+                uid: ws.userId,
+                project_id: data.projectId,
+                amount: data.amount,
+                type: "earn",
+                source: data.source,
+                reference_id: data.reference_id || null
+              });
+
+            ws.send(JSON.stringify({ success: true, message: "Circuit 幣已發放", amount: data.amount }));
+            break;
+
+          default:
+            ws.send(JSON.stringify({ success: false, message: "未知指令" }));
         }
 
       } catch (err) {
-        ws.send(JSON.stringify({
-          success: false,
-          message: "訊息格式錯誤"
-        }));
+        ws.send(JSON.stringify({ success: false, message: err.message }));
       }
     });
 
@@ -144,10 +139,5 @@ wss.on("connection", async (ws, req) => {
   }
 });
 
-/* =========================
-   7️⃣ 啟動伺服器
-========================= */
-
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// ======= 啟動服務 =======
+server.listen(PORT, () => console.log(`Master Server running on port ${PORT}`));
